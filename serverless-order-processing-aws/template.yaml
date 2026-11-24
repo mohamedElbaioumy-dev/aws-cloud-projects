@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: FlashOrders - order intake under promotional load, with monitoring and failure experiments.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Description: Address that receives alarm notifications (you must confirm the SNS subscription email).
+  ApiRateLimit:
+    Type: Number
+    Default: 100
+    Description: Usage plan steady-state requests per second.
+  ApiBurstLimit:
+    Type: Number
+    Default: 200
+  ApiDailyQuota:
+    Type: Number
+    Default: 50000
+    Description: Maximum requests per day through the demo API key. A request cap, not a spend cap.
+  WorkerMaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 1000
+    Description: Cap on concurrent worker invocations from the queue (minimum 2). Low on purpose so backlog is visible in a demo.
+  BacklogAgeSeconds:
+    Type: Number
+    Default: 120
+  BacklogDepth:
+    Type: Number
+    Default: 300
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 256
+    CodeUri: src/
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref OrdersTable
+
+Resources:
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  OrdersDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # Six times the worker timeout (15 s), as the Lambda SQS guidance recommends.
+      VisibilityTimeout: 90
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDlq.Arn
+        maxReceiveCount: 5
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  IntakeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-intake
+      RetentionInDays: 14
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-worker
+      RetentionInDays: 14
+
+  IntakeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: intake
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${IntakeLogGroup.Arn}:*
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem]
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt OrdersQueue.Arn
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${WorkerLogGroup.Arn}:*
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt OrdersQueue.Arn
+
+  IntakeFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: IntakeLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-intake
+      Handler: intake.handler
+      Timeout: 10
+      Role: !GetAtt IntakeRole.Arn
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref OrdersQueue
+      Events:
+        CreateOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrdersApi
+            Path: /orders
+            Method: post
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: WorkerLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-worker
+      Handler: worker.handler
+      Timeout: 15
+      Role: !GetAtt WorkerRole.Arn
+      Events:
+        Orders:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: !Ref WorkerMaxConcurrency
+
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      StageName: prod
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: !Sub ${AWS::StackName}-plan
+          Throttle:
+            RateLimit: !Ref ApiRateLimit
+            BurstLimit: !Ref ApiBurstLimit
+          Quota:
+            Limit: !Ref ApiDailyQuota
+            Period: DAY
+
+  # ---------- Alarms ----------
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-dlq-not-empty
+      AlarmDescription: Orders gave up after repeated failures. Inspect with tools/ops.py dlq.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt OrdersDlq.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  BacklogAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-backlog-age
+      AlarmDescription: The oldest order has waited too long, customers are not getting confirmations.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions: [{Name: QueueName, Value: !GetAtt OrdersQueue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref BacklogAgeSeconds
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  BacklogDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-backlog-depth
+      AlarmDescription: Messages are arriving faster than the worker drains them.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt OrdersQueue.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref BacklogDepth
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-worker-failures
+      AlarmDescription: Worker is reporting failed messages (custom metric MessageFailures).
+      Namespace: FlashOrders
+      MetricName: MessageFailures
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  IntakeErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-intake-errors
+      AlarmDescription: Intake function crashed or API Gateway returned 5XX.
+      Metrics:
+        - Id: api5xx
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApiGateway
+              MetricName: 5XXError
+              Dimensions: [{Name: ApiName, Value: !Sub "${AWS::StackName}-api"}]
+            Period: 60
+            Stat: Sum
+        - Id: fnerr
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{Name: FunctionName, Value: !Ref IntakeFunction}]
+            Period: 60
+            Stat: Sum
+        - Id: total
+          Expression: "FILL(api5xx, 0) + FILL(fnerr, 0)"
+          Label: intake failures
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # ---------- Dashboard ----------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":8,"height":6,"properties":{"title":"Intake: requests and errors","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["FlashOrders","OrdersAccepted"],[".","OrdersDuplicate"],[".","OrdersRejectedAtIntake"],["AWS/Lambda","Errors","FunctionName","${IntakeFunction}",{"label":"intake errors"}]]}},
+          {"type":"metric","x":8,"y":0,"width":8,"height":6,"properties":{"title":"Queue depth (visible) and in flight","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,"metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${OrdersQueue.QueueName}"],[".","ApproximateNumberOfMessagesNotVisible",".","."]]}},
+          {"type":"metric","x":16,"y":0,"width":8,"height":6,"properties":{"title":"Age of oldest message (seconds)","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,"annotations":{"horizontal":[{"label":"alarm","value":${BacklogAgeSeconds}}]},"metrics":[["AWS/SQS","ApproximateAgeOfOldestMessage","QueueName","${OrdersQueue.QueueName}"]]}},
+          {"type":"metric","x":0,"y":6,"width":8,"height":6,"properties":{"title":"Worker outcomes","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["FlashOrders","OrdersConfirmed"],[".","MessageFailures"],[".","DuplicateDeliveries"],[".","OrdersRejected"]]}},
+          {"type":"metric","x":8,"y":6,"width":8,"height":6,"properties":{"title":"Worker duration p95 (ms) and concurrency","region":"${AWS::Region}","view":"timeSeries","period":60,"metrics":[["AWS/Lambda","Duration","FunctionName","${WorkerFunction}",{"stat":"p95"}],["AWS/Lambda","ConcurrentExecutions","FunctionName","${WorkerFunction}",{"stat":"Maximum","yAxis":"right"}]]}},
+          {"type":"metric","x":16,"y":6,"width":8,"height":6,"properties":{"title":"Order wait before confirm, worst per batch (ms)","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,"metrics":[["FlashOrders","ConfirmLatencyMs"]]}},
+          {"type":"metric","x":0,"y":12,"width":8,"height":6,"properties":{"title":"Dead-letter queue (visible)","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,"metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${OrdersDlq.QueueName}"]]}},
+          {"type":"metric","x":8,"y":12,"width":8,"height":6,"properties":{"title":"API Gateway: calls, 4XX, 5XX","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/ApiGateway","Count","ApiName","${AWS::StackName}-api"],[".","4XXError",".","."],[".","5XXError",".","."]]}},
+          {"type":"alarm","x":16,"y":12,"width":8,"height":6,"properties":{"title":"Alarm status","alarms":["${DlqNotEmptyAlarm.Arn}","${BacklogAgeAlarm.Arn}","${BacklogDepthAlarm.Arn}","${WorkerErrorsAlarm.Arn}","${IntakeErrorsAlarm.Arn}"]}}
+        ]}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/prod/orders
+  ApiKeyId:
+    Value: !Ref OrdersApiApiKey
+  TableName:
+    Value: !Ref OrdersTable
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  DlqUrl:
+    Value: !Ref OrdersDlq
+  DashboardName:
+    Value: !Ref Dashboard
